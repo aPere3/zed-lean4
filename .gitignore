@@ -1,5 +1,6 @@
 /target
 /grammars
+/companion/target
 extension.wasm
 .DS_Store
 *.wasm

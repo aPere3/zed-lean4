@@ -1,0 +1,14 @@
+[package]
+name = "zed-lean4-companion"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Companion infoview for the Zed Lean 4 extension: LSP proxy + terminal UI."
+
+# Standalone package, not part of the extension's cargo build.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
