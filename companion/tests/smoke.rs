@@ -145,8 +145,13 @@ fn proxy_end_to_end() {
         }
         assert!(Instant::now() < deadline, "no goals before timeout");
     };
-    let goal = goals[0].as_str().unwrap();
-    assert!(goal.contains("⊢ 1 + 1 = 2"), "unexpected goal: {goal}");
+    let target: String = goals[0]["target"]
+        .as_array()
+        .expect("structured goal target")
+        .iter()
+        .map(|s| s["text"].as_str().unwrap_or(""))
+        .collect();
+    assert!(target.contains("1 + 1 = 2"), "unexpected goal: {target}");
 
     // The documentHighlight response (or error) must still reach the client.
     let deadline = Instant::now() + Duration::from_secs(30);

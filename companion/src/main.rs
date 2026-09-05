@@ -1,3 +1,4 @@
+mod convert;
 mod proxy;
 mod rpc;
 mod state;

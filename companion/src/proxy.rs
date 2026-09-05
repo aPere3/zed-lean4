@@ -2,16 +2,22 @@
 //!
 //! All traffic is passed through unchanged. On the side, the proxy:
 //! - tracks the cursor from `textDocument/documentHighlight` requests
-//!   (Zed sends one on every selection change);
-//! - sends its own `$/lean/plainGoal` / `$/lean/plainTermGoal` requests
-//!   (string ids prefixed `infoview:`, so they never collide with Zed's
-//!   numeric ids, and their responses are filtered out of the stream);
-//! - collects `textDocument/publishDiagnostics` and `$/lean/fileProgress`;
-//! - broadcasts an `InfoviewState` JSON line to every watcher connected
-//!   on the unix socket, on every change.
+//!   (Zed sends one on every selection change) and from `didChange`;
+//! - keeps one `$/lean/rpc/connect` session per file (with keep-alives) and
+//!   queries `Lean.Widget.getInteractiveGoals` / `getInteractiveTermGoal` /
+//!   `getInteractiveDiagnostics` at the cursor. Its own requests use string
+//!   ids prefixed `infoview:`, so they never collide with Zed's numeric ids,
+//!   and their responses are filtered out of the stream;
+//! - eagerly expands lazy trace children (bounded by depth and count);
+//! - broadcasts an `InfoviewState` JSON line to every watcher connected on
+//!   the unix socket, on every change.
+//!
+//! Known simplification: RpcPtr references in responses are never released,
+//! so they accumulate in the server for the lifetime of a session.
 
+use crate::convert;
 use crate::rpc::{read_message, write_message};
-use crate::state::{Diag, InfoviewState, socket_dir, socket_path_for_root};
+use crate::state::{Diag, InfoviewState, MsgSeg, TextSpan, socket_dir, socket_path_for_root};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufReader, Result, Write};
@@ -19,6 +25,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Lean server error code: the RPC session has expired.
+const RPC_NEEDS_RECONNECT: i64 = -32900;
+/// How deep to fetch lazy trace children.
+const MAX_TRACE_DEPTH: u32 = 2;
+/// How many lazy fetches per diagnostics generation.
+const MAX_TRACE_EXPANSIONS: u64 = 64;
 
 #[derive(Clone)]
 struct Cursor {
@@ -27,14 +41,32 @@ struct Cursor {
     character: u64,
 }
 
+struct ExpandReq {
+    generation: u64,
+    node_id: u32,
+    depth: u32,
+}
+
 struct Shared {
     state: Mutex<InfoviewState>,
     clients: Mutex<Vec<UnixStream>>,
     child_stdin: Mutex<ChildStdin>,
     cursor: Mutex<Option<Cursor>>,
-    diags: Mutex<HashMap<String, Vec<Diag>>>,
-    /// Generation of the last goal-request pair; stale responses are dropped.
+    /// Plain diagnostics per uri, shown until interactive ones arrive.
+    plain_diags: Mutex<HashMap<String, Vec<Diag>>>,
+    /// uri -> RPC sessionId (opaque JSON value).
+    sessions: Mutex<HashMap<String, Value>>,
+    /// Pending `$/lean/rpc/connect` request id -> uri.
+    pending_connect: Mutex<HashMap<String, String>>,
+    /// Pending trace-expansion request id -> request info.
+    pending_expand: Mutex<HashMap<String, ExpandReq>>,
+    /// Generation of the last goal-request wave; stale responses are dropped.
     generation: AtomicU64,
+    /// Generation the displayed interactive diagnostics belong to.
+    diag_generation: AtomicU64,
+    /// Lazy expansions done for the current diagnostics generation.
+    expansions: AtomicU64,
+    next_req: AtomicU64,
     socket_path: Mutex<Option<std::path::PathBuf>>,
 }
 
@@ -57,10 +89,43 @@ pub fn run(server_cmd: Vec<String>) -> Result<()> {
         clients: Mutex::new(Vec::new()),
         child_stdin: Mutex::new(child_stdin),
         cursor: Mutex::new(None),
-        diags: Mutex::new(HashMap::new()),
+        plain_diags: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        pending_connect: Mutex::new(HashMap::new()),
+        pending_expand: Mutex::new(HashMap::new()),
         generation: AtomicU64::new(0),
+        diag_generation: AtomicU64::new(0),
+        expansions: AtomicU64::new(0),
+        next_req: AtomicU64::new(0),
         socket_path: Mutex::new(None),
     });
+
+    // RPC sessions expire without keep-alives (VSCode sends one every 10 s).
+    {
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                let sessions: Vec<(String, Value)> = shared
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (uri, session_id) in sessions {
+                    send_to_server(
+                        &shared,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "$/lean/rpc/keepAlive",
+                            "params": { "uri": uri, "sessionId": session_id },
+                        }),
+                    );
+                }
+            }
+        });
+    }
 
     // Server -> Zed.
     let s2c = {
@@ -119,10 +184,12 @@ fn log(msg: std::fmt::Arguments) {
     eprintln!("[companion] {msg}");
 }
 
+fn send_to_server(shared: &Shared, msg: &Value) {
+    let mut child_in = shared.child_stdin.lock().unwrap();
+    let _ = write_message(&mut *child_in, msg.to_string().as_bytes());
+}
+
 fn inspect_client_msg(shared: &Arc<Shared>, v: &Value) {
-    if let Some(method) = v["method"].as_str() {
-        log(format_args!("<- client: {method}"));
-    }
     match v["method"].as_str() {
         Some("initialize") => {
             let root = v["params"]["rootUri"]
@@ -196,13 +263,16 @@ fn inspect_server_msg(shared: &Arc<Shared>, v: &Value) {
                             line: d["range"]["start"]["line"].as_u64().unwrap_or(0) as u32,
                             column: d["range"]["start"]["character"].as_u64().unwrap_or(0) as u32,
                             severity: d["severity"].as_u64().unwrap_or(1) as u8,
-                            message: d["message"].as_str().unwrap_or("").to_string(),
+                            message: vec![MsgSeg::Text(TextSpan {
+                                text: d["message"].as_str().unwrap_or("").to_string(),
+                                diff: None,
+                            })],
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             shared
-                .diags
+                .plain_diags
                 .lock()
                 .unwrap()
                 .insert(uri.to_string(), diags.clone());
@@ -212,7 +282,10 @@ fn inspect_server_msg(shared: &Arc<Shared>, v: &Value) {
                 .unwrap()
                 .as_ref()
                 .is_some_and(|c| c.uri == uri);
-            if at_cursor {
+            // Show plain diagnostics only until interactive ones exist;
+            // afterwards the next wave (fileProgress done, cursor move)
+            // refreshes the interactive ones without flicker.
+            if at_cursor && shared.diag_generation.load(Ordering::SeqCst) == 0 {
                 shared.state.lock().unwrap().diagnostics = diags;
                 broadcast(shared);
             }
@@ -222,9 +295,7 @@ fn inspect_server_msg(shared: &Arc<Shared>, v: &Value) {
             let Some(uri) = p["textDocument"]["uri"].as_str() else {
                 return;
             };
-            let processing = p["processing"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty());
+            let processing = p["processing"].as_array().is_some_and(|a| !a.is_empty());
             let at_cursor = shared
                 .cursor
                 .lock()
@@ -238,7 +309,7 @@ fn inspect_server_msg(shared: &Arc<Shared>, v: &Value) {
                     st.processing = processing;
                     changed
                 };
-                // Elaboration finished: refresh the goals at the cursor.
+                // Elaboration finished: refresh everything at the cursor.
                 if changed && !processing {
                     send_goal_requests(shared);
                 } else if changed {
@@ -250,47 +321,63 @@ fn inspect_server_msg(shared: &Arc<Shared>, v: &Value) {
     }
 }
 
+fn ensure_session(shared: &Arc<Shared>, uri: &str) {
+    {
+        let pending = shared.pending_connect.lock().unwrap();
+        if pending.values().any(|u| u == uri) {
+            return;
+        }
+    }
+    let n = shared.next_req.fetch_add(1, Ordering::SeqCst);
+    let id = format!("infoview:c:{n}");
+    shared
+        .pending_connect
+        .lock()
+        .unwrap()
+        .insert(id.clone(), uri.to_string());
+    log(format_args!("-> rpc/connect {uri}"));
+    send_to_server(
+        shared,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "$/lean/rpc/connect",
+            "params": { "uri": uri },
+        }),
+    );
+}
+
+fn rpc_call(shared: &Shared, c: &Cursor, session_id: &Value, id: String, method: &str, params: Value) {
+    send_to_server(
+        shared,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "$/lean/rpc/call",
+            "params": {
+                "method": method,
+                "params": params,
+                "sessionId": session_id,
+                "textDocument": { "uri": c.uri },
+                "position": { "line": c.line, "character": c.character },
+            },
+        }),
+    );
+}
+
 fn send_goal_requests(shared: &Arc<Shared>) {
     let Some(c) = shared.cursor.lock().unwrap().clone() else {
         return;
     };
-    let generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    log(format_args!(
-        "-> goals? gen={generation} {}:{}:{}",
-        c.uri, c.line, c.character
-    ));
-    let params = json!({
-        "textDocument": { "uri": c.uri },
-        "position": { "line": c.line, "character": c.character },
-    });
-    let reqs = [
-        json!({
-            "jsonrpc": "2.0",
-            "id": format!("infoview:g:{generation}"),
-            "method": "$/lean/plainGoal",
-            "params": params,
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": format!("infoview:t:{generation}"),
-            "method": "$/lean/plainTermGoal",
-            "params": params,
-        }),
-    ];
-    {
-        let mut child_in = shared.child_stdin.lock().unwrap();
-        for r in &reqs {
-            let _ = write_message(&mut *child_in, r.to_string().as_bytes());
-        }
-    }
     {
         let mut st = shared.state.lock().unwrap();
         st.line = c.line as u32;
         st.column = c.character as u32;
         if st.uri.as_deref() != Some(&c.uri) {
             st.uri = Some(c.uri.clone());
+            // Until interactive diagnostics for this file arrive.
             st.diagnostics = shared
-                .diags
+                .plain_diags
                 .lock()
                 .unwrap()
                 .get(&c.uri)
@@ -298,6 +385,45 @@ fn send_goal_requests(shared: &Arc<Shared>) {
                 .unwrap_or_default();
         }
     }
+    let session = shared.sessions.lock().unwrap().get(&c.uri).cloned();
+    let Some(session_id) = session else {
+        ensure_session(shared, &c.uri);
+        broadcast(shared);
+        return;
+    };
+    let generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    log(format_args!(
+        "-> goals? gen={generation} {}:{}:{}",
+        c.uri, c.line, c.character
+    ));
+    let tdpp = json!({
+        "textDocument": { "uri": c.uri },
+        "position": { "line": c.line, "character": c.character },
+    });
+    rpc_call(
+        shared,
+        &c,
+        &session_id,
+        format!("infoview:g:{generation}"),
+        "Lean.Widget.getInteractiveGoals",
+        tdpp.clone(),
+    );
+    rpc_call(
+        shared,
+        &c,
+        &session_id,
+        format!("infoview:t:{generation}"),
+        "Lean.Widget.getInteractiveTermGoal",
+        tdpp,
+    );
+    rpc_call(
+        shared,
+        &c,
+        &session_id,
+        format!("infoview:d:{generation}"),
+        "Lean.Widget.getInteractiveDiagnostics",
+        json!({}),
+    );
     broadcast(shared);
 }
 
@@ -306,71 +432,179 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
     let Some(id) = v["id"].as_str() else {
         return false;
     };
-    let Some(rest) = id.strip_prefix("infoview:") else {
+    if !id.starts_with("infoview:") {
         return false;
-    };
+    }
     // A request *from* the server could in principle carry any id; only treat
     // id-only messages (responses) as ours.
     if v["method"].as_str().is_some() {
         return false;
     }
-    let (kind, generation) = match rest.split_once(':') {
-        Some((k, g)) => (k, g.parse::<u64>().unwrap_or(0)),
-        None => return true,
+    let Some((kind, tail)) = id
+        .strip_prefix("infoview:")
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return true;
     };
-    if generation != shared.generation.load(Ordering::SeqCst) {
-        log(format_args!("<- stale response {kind} gen={generation}"));
+
+    if !v["error"].is_null() {
+        let code = v["error"]["code"].as_i64().unwrap_or(0);
+        log(format_args!("<- error for {kind}:{tail}: {}", v["error"]));
+        shared.pending_connect.lock().unwrap().remove(id);
+        shared.pending_expand.lock().unwrap().remove(id);
+        if code == RPC_NEEDS_RECONNECT
+            && let Some(c) = shared.cursor.lock().unwrap().clone()
+        {
+            shared.sessions.lock().unwrap().remove(&c.uri);
+            ensure_session(shared, &c.uri);
+        }
         return true;
     }
-    if !v["error"].is_null() {
-        log(format_args!(
-            "<- error for {kind} gen={generation}: {}",
-            v["error"]
-        ));
-        return true; // keep the previous state
+
+    match kind {
+        "c" => {
+            let Some(uri) = shared.pending_connect.lock().unwrap().remove(id) else {
+                return true;
+            };
+            let session_id = v["result"]["sessionId"].clone();
+            if session_id.is_null() {
+                log(format_args!("<- rpc/connect: no sessionId in {}", v["result"]));
+                return true;
+            }
+            log(format_args!("<- rpc/connect ok for {uri}"));
+            shared
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(uri.clone(), session_id);
+            let at_cursor = shared
+                .cursor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.uri == uri);
+            if at_cursor {
+                send_goal_requests(shared);
+            }
+        }
+        "g" | "t" | "d" => {
+            let generation = tail.parse::<u64>().unwrap_or(0);
+            if generation != shared.generation.load(Ordering::SeqCst) {
+                return true; // stale
+            }
+            let result = &v["result"];
+            log(format_args!(
+                "<- result for {kind} gen={generation}: {}",
+                if result.is_null() { "null" } else { "ok" }
+            ));
+            match kind {
+                "g" => {
+                    let goals = (!result.is_null()).then(|| {
+                        result["goals"]
+                            .as_array()
+                            .map(|gs| gs.iter().map(convert::conv_goal).collect())
+                            .unwrap_or_default()
+                    });
+                    shared.state.lock().unwrap().goals = goals;
+                }
+                "t" => {
+                    let term = (!result.is_null()).then(|| convert::conv_term_goal(result));
+                    shared.state.lock().unwrap().term_goal = term;
+                }
+                "d" => {
+                    let diags: Vec<Diag> = result
+                        .as_array()
+                        .map(|ds| {
+                            ds.iter()
+                                .enumerate()
+                                .map(|(i, d)| convert::conv_interactive_diag(d, i))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    shared.state.lock().unwrap().diagnostics = diags;
+                    shared.diag_generation.store(generation, Ordering::SeqCst);
+                    shared.expansions.store(0, Ordering::SeqCst);
+                    request_lazy_children(shared);
+                }
+                _ => unreachable!(),
+            }
+            broadcast(shared);
+        }
+        "x" => {
+            let Some(req) = shared.pending_expand.lock().unwrap().remove(id) else {
+                return true;
+            };
+            if req.generation != shared.diag_generation.load(Ordering::SeqCst) {
+                return true; // diagnostics were replaced meanwhile
+            }
+            let children = v["result"]
+                .as_array()
+                .map(|list| convert::conv_children(list, req.node_id as u64, req.depth))
+                .unwrap_or_default();
+            {
+                let mut st = shared.state.lock().unwrap();
+                for d in &mut st.diagnostics {
+                    if let Some(node) = convert::find_trace_mut(&mut d.message, req.node_id) {
+                        node.children = children;
+                        node.truncated = false;
+                        break;
+                    }
+                }
+            }
+            request_lazy_children(shared);
+            broadcast(shared);
+        }
+        _ => {}
     }
-    let result = &v["result"];
-    log(format_args!(
-        "<- result for {kind} gen={generation}: {}",
-        if result.is_null() { "null" } else { "ok" }
-    ));
+    true
+}
+
+/// Fires `lazyTraceChildrenToInteractive` calls for unexpanded trace nodes,
+/// bounded by depth and a per-generation budget.
+fn request_lazy_children(shared: &Arc<Shared>) {
+    let Some(c) = shared.cursor.lock().unwrap().clone() else {
+        return;
+    };
+    let Some(session_id) = shared.sessions.lock().unwrap().get(&c.uri).cloned() else {
+        return;
+    };
+    let generation = shared.diag_generation.load(Ordering::SeqCst);
+    let mut to_fetch: Vec<(u32, u32, Value)> = Vec::new();
     {
         let mut st = shared.state.lock().unwrap();
-        match kind {
-            "g" => {
-                st.goals = if result.is_null() {
-                    None
-                } else if let Some(goals) = result["goals"].as_array() {
-                    Some(
-                        goals
-                            .iter()
-                            .filter_map(|g| g.as_str().map(String::from))
-                            .collect(),
-                    )
-                } else {
-                    // Old servers: only `rendered` (markdown). Strip the fences.
-                    let rendered = result["rendered"].as_str().unwrap_or("");
-                    let text: String = rendered
-                        .lines()
-                        .filter(|l| !l.trim_start().starts_with("```"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let text = text.trim();
-                    if text.is_empty() {
-                        Some(vec![])
-                    } else {
-                        Some(vec![text.to_string()])
-                    }
-                };
-            }
-            "t" => {
-                st.term_goal = result["goal"].as_str().map(String::from);
-            }
-            _ => {}
+        for d in &mut st.diagnostics {
+            convert::visit_traces_mut(&mut d.message, &mut |node| {
+                if node.depth < MAX_TRACE_DEPTH
+                    && node.lazy_ptr.is_some()
+                    && shared.expansions.load(Ordering::SeqCst) < MAX_TRACE_EXPANSIONS
+                {
+                    shared.expansions.fetch_add(1, Ordering::SeqCst);
+                    let ptr = node.lazy_ptr.take().expect("checked is_some");
+                    to_fetch.push((node.id, node.depth, ptr));
+                }
+            });
         }
     }
-    broadcast(shared);
-    true
+    for (node_id, depth, ptr) in to_fetch {
+        let n = shared.next_req.fetch_add(1, Ordering::SeqCst);
+        let id = format!("infoview:x:{n}");
+        shared.pending_expand.lock().unwrap().insert(
+            id.clone(),
+            ExpandReq {
+                generation,
+                node_id,
+                depth,
+            },
+        );
+        rpc_call(
+            shared,
+            &c,
+            &session_id,
+            id,
+            "Lean.Widget.lazyTraceChildrenToInteractive",
+            ptr,
+        );
+    }
 }
 
 fn start_socket(shared: &Arc<Shared>, root: &str) {

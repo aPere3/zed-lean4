@@ -1,11 +1,15 @@
 //! Terminal UI: connects to the proxy socket and renders the infoview live.
+//!
+//! Keys: q quit · j/k scroll · Tab/Shift-Tab focus trace nodes · Enter fold.
 
-use crate::state::{InfoviewState, socket_dir, socket_path_for_root};
+use crate::state::{Diag, Goal, InfoviewState, MsgSeg, TextSpan, socket_dir, socket_path_for_root};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Result};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -17,6 +21,18 @@ pub fn run() -> Result<()> {
     let result = run_inner(&mut terminal);
     ratatui::restore();
     result
+}
+
+#[derive(Default)]
+struct App {
+    state: InfoviewState,
+    scroll: u16,
+    /// Fold state the user changed, by trace node id.
+    fold_overrides: HashMap<u32, bool>,
+    /// Focused trace node id (target of Enter).
+    focus: Option<u32>,
+    /// Trace nodes visible in the last render: (id, effectively collapsed).
+    folds: Vec<(u32, bool)>,
 }
 
 fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
@@ -40,8 +56,7 @@ fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
         };
 
         let rx = spawn_reader(stream);
-        let mut state = InfoviewState::default();
-        let mut scroll: u16 = 0;
+        let mut app = App::default();
         'connected: loop {
             while event::poll(Duration::ZERO)? {
                 if let Event::Key(k) = event::read()?
@@ -52,27 +67,60 @@ fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
                         }
-                        KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-                        KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
-                        KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                        KeyCode::PageDown => scroll = scroll.saturating_add(10),
-                        KeyCode::Home => scroll = 0,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.scroll = app.scroll.saturating_sub(1)
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.scroll = app.scroll.saturating_add(1)
+                        }
+                        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
+                        KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
+                        KeyCode::Home => app.scroll = 0,
+                        KeyCode::Tab => move_focus(&mut app, 1),
+                        KeyCode::BackTab => move_focus(&mut app, -1),
+                        KeyCode::Enter | KeyCode::Char(' ') => toggle_focused(&mut app),
                         _ => {}
                     }
                 }
             }
             loop {
                 match rx.try_recv() {
-                    Ok(s) => state = s,
+                    Ok(s) => app.state = s,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break 'connected, // reconnect
                 }
             }
-            terminal.draw(|f| draw_state(f, &state, scroll))?;
+            let rendered = build(&app);
+            app.folds = rendered.folds.clone();
+            terminal.draw(|f| draw_state(f, &rendered.lines, app.scroll))?;
             if quit_requested(Duration::from_millis(50))? {
                 return Ok(());
             }
         }
+    }
+}
+
+fn move_focus(app: &mut App, dir: i32) {
+    if app.folds.is_empty() {
+        app.focus = None;
+        return;
+    }
+    let cur = app
+        .focus
+        .and_then(|id| app.folds.iter().position(|(i, _)| *i == id));
+    let next = match (cur, dir) {
+        (None, _) => 0,
+        (Some(i), 1) => (i + 1) % app.folds.len(),
+        (Some(i), _) => (i + app.folds.len() - 1) % app.folds.len(),
+    };
+    app.focus = Some(app.folds[next].0);
+}
+
+fn toggle_focused(app: &mut App) {
+    if let Some(id) = app.focus
+        && let Some((_, collapsed)) = app.folds.iter().find(|(i, _)| *i == id)
+    {
+        app.fold_overrides.insert(id, !collapsed);
     }
 }
 
@@ -81,8 +129,7 @@ fn quit_requested(timeout: Duration) -> Result<bool> {
         && let Event::Key(k) = event::read()?
         && k.kind == KeyEventKind::Press
     {
-        let ctrl_c =
-            k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
         return Ok(matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c);
     }
     Ok(false)
@@ -147,8 +194,48 @@ fn draw_waiting(f: &mut Frame) {
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), f.area());
 }
 
-fn draw_state(f: &mut Frame, s: &InfoviewState, scroll: u16) {
-    let mut lines: Vec<Line> = Vec::new();
+fn draw_state(f: &mut Frame, lines: &[Line<'static>], scroll: u16) {
+    let [main, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+        .areas(f.area());
+    f.render_widget(
+        Paragraph::new(lines.to_vec())
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        main,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " q quit · j/k scroll · tab traces · ⏎ fold",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+struct Rendered {
+    lines: Vec<Line<'static>>,
+    folds: Vec<(u32, bool)>,
+}
+
+struct Ctx<'a> {
+    lines: Vec<Line<'static>>,
+    folds: Vec<(u32, bool)>,
+    overrides: &'a HashMap<u32, bool>,
+    focus: Option<u32>,
+}
+
+fn build(app: &App) -> Rendered {
+    let s = &app.state;
+    let mut ctx = Ctx {
+        lines: Vec::new(),
+        folds: Vec::new(),
+        overrides: &app.fold_overrides,
+        focus: app.focus,
+    };
 
     // Header: file:line:col + status.
     let file = s
@@ -176,84 +263,67 @@ fn draw_state(f: &mut Frame, s: &InfoviewState, scroll: u16) {
     } else {
         header.push(Span::styled("✓", Style::default().fg(Color::Green)));
     }
-    lines.push(Line::from(header));
-    lines.push(Line::from(""));
+    ctx.lines.push(Line::from(header));
+    ctx.lines.push(Line::from(""));
 
     // Tactic goals.
     match &s.goals {
         None => {}
         Some(goals) if goals.is_empty() => {
-            lines.push(section("Tactic state"));
-            lines.push(Line::from(Span::styled(
+            ctx.lines.push(section("Tactic state"));
+            ctx.lines.push(Line::from(Span::styled(
                 "Goals accomplished 🎉",
                 Style::default().fg(Color::Green),
             )));
-            lines.push(Line::from(""));
+            ctx.lines.push(Line::from(""));
         }
         Some(goals) => {
-            lines.push(section(&format!(
+            ctx.lines.push(section(&format!(
                 "Tactic state ({} goal{})",
                 goals.len(),
                 if goals.len() == 1 { "" } else { "s" }
             )));
             for (i, goal) in goals.iter().enumerate() {
                 if i > 0 {
-                    lines.push(Line::from(Span::styled(
+                    ctx.lines.push(Line::from(Span::styled(
                         "─".repeat(40),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                for l in goal.lines() {
-                    lines.push(goal_line(l));
-                }
+                push_goal(&mut ctx.lines, 0, goal);
             }
-            lines.push(Line::from(""));
+            ctx.lines.push(Line::from(""));
         }
     }
 
     // Term goal.
     if let Some(term) = &s.term_goal {
-        lines.push(section("Expected type"));
-        for l in term.lines() {
-            lines.push(goal_line(l));
-        }
-        lines.push(Line::from(""));
+        ctx.lines.push(section("Expected type"));
+        push_goal(&mut ctx.lines, 0, term);
+        ctx.lines.push(Line::from(""));
     }
 
     // Diagnostics.
     if !s.diagnostics.is_empty() {
-        lines.push(section(&format!("Messages ({})", s.diagnostics.len())));
+        ctx.lines
+            .push(section(&format!("Messages ({})", s.diagnostics.len())));
         for d in &s.diagnostics {
-            let (label, color) = match d.severity {
-                1 => ("error", Color::Red),
-                2 => ("warning", Color::Yellow),
-                4 => ("hint", Color::DarkGray),
-                _ => ("info", Color::Blue),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("▸ {}:{} ", d.line + 1, d.column + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            ]));
-            for l in d.message.lines() {
-                lines.push(Line::from(format!("  {l}")));
-            }
+            push_diag_header(&mut ctx.lines, d);
+            push_segs(&mut ctx, &d.message, 2);
         }
     }
 
     if s.goals.is_none() && s.term_goal.is_none() && s.diagnostics.is_empty() {
-        lines.push(Line::from(Span::styled(
+        ctx.lines.push(Line::from(Span::styled(
             "No info at cursor.",
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).wrap(Wrap { trim: false }),
-        f.area(),
-    );
+    Rendered {
+        lines: ctx.lines,
+        folds: ctx.folds,
+    }
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -265,16 +335,186 @@ fn section(title: &str) -> Line<'static> {
     ))
 }
 
-fn goal_line(l: &str) -> Line<'static> {
-    let trimmed = l.trim_start();
-    let style = if trimmed.starts_with('⊢') {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else if trimmed.starts_with("case ") {
-        Style::default().fg(Color::Magenta)
+/// Styles goal-diff tags like the VSCode infoview does.
+fn diff_style(diff: &Option<String>, base: Style) -> Style {
+    match diff.as_deref() {
+        Some("wasChanged" | "willChange") => base.fg(Color::Yellow),
+        Some("wasInserted" | "willInsert" | "willInserted") => base.fg(Color::Green),
+        Some("wasDeleted" | "willDelete" | "willDeleted") => {
+            base.fg(Color::Red).add_modifier(Modifier::CROSSED_OUT)
+        }
+        _ => base,
+    }
+}
+
+fn rich_parts(spans: &[TextSpan], base: Style) -> Vec<(String, Style)> {
+    spans
+        .iter()
+        .map(|s| (s.text.clone(), diff_style(&s.diff, base)))
+        .collect()
+}
+
+/// Appends styled parts as one or more lines, splitting on '\n' and applying
+/// the indent to every produced line.
+fn push_rich(lines: &mut Vec<Line<'static>>, indent: usize, parts: &[(String, Style)]) {
+    let pad = " ".repeat(indent);
+    let mut cur: Vec<Span<'static>> = vec![Span::raw(pad.clone())];
+    for (text, style) in parts {
+        let mut first = true;
+        for piece in text.split('\n') {
+            if !first {
+                lines.push(Line::from(std::mem::take(&mut cur)));
+                cur.push(Span::raw(pad.clone()));
+            }
+            if !piece.is_empty() {
+                cur.push(Span::styled(piece.to_string(), *style));
+            }
+            first = false;
+        }
+    }
+    lines.push(Line::from(cur));
+}
+
+fn push_goal(lines: &mut Vec<Line<'static>>, indent: usize, g: &Goal) {
+    let base = if g.is_removed {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::CROSSED_OUT)
+    } else if g.is_inserted {
+        Style::default().fg(Color::Green)
     } else {
         Style::default()
     };
-    Line::from(Span::styled(l.to_string(), style))
+    if let Some(name) = &g.name {
+        push_rich(
+            lines,
+            indent,
+            &[(format!("case {name}"), Style::default().fg(Color::Magenta))],
+        );
+    }
+    for h in &g.hyps {
+        let mut hbase = if h.is_removed {
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::CROSSED_OUT)
+        } else if h.is_inserted {
+            Style::default().fg(Color::Green)
+        } else {
+            base
+        };
+        if h.is_instance {
+            hbase = hbase.add_modifier(Modifier::DIM);
+        }
+        let mut parts = vec![
+            (h.names.join(" "), hbase),
+            (" : ".to_string(), hbase.fg(Color::DarkGray)),
+        ];
+        parts.extend(rich_parts(&h.ty, hbase));
+        if let Some(val) = &h.val {
+            parts.push((" := ".to_string(), hbase.fg(Color::DarkGray)));
+            parts.extend(rich_parts(val, hbase));
+        }
+        push_rich(lines, indent, &parts);
+    }
+    let mut parts = vec![(g.prefix.clone(), base.add_modifier(Modifier::BOLD))];
+    parts.extend(rich_parts(&g.target, base));
+    push_rich(lines, indent, &parts);
+}
+
+fn push_diag_header(lines: &mut Vec<Line<'static>>, d: &Diag) {
+    let (label, color) = match d.severity {
+        1 => ("error", Color::Red),
+        2 => ("warning", Color::Yellow),
+        4 => ("hint", Color::DarkGray),
+        _ => ("info", Color::Blue),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("▸ {}:{} ", d.line + 1, d.column + 1),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+}
+
+fn push_segs(ctx: &mut Ctx, segs: &[MsgSeg], indent: usize) {
+    // Consecutive text segments render as one rich block; goals and traces
+    // flush it and render as blocks of their own.
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    let flush = |ctx: &mut Ctx, parts: &mut Vec<(String, Style)>| {
+        if !parts.is_empty() {
+            push_rich(&mut ctx.lines, indent, parts);
+            parts.clear();
+        }
+    };
+    for seg in segs {
+        match seg {
+            MsgSeg::Text(span) => {
+                parts.push((span.text.clone(), diff_style(&span.diff, Style::default())));
+            }
+            MsgSeg::Goal(goal) => {
+                flush(ctx, &mut parts);
+                push_goal(&mut ctx.lines, indent, goal);
+            }
+            MsgSeg::Trace(node) => {
+                flush(ctx, &mut parts);
+                let collapsed = ctx
+                    .overrides
+                    .get(&node.id)
+                    .copied()
+                    .unwrap_or(node.collapsed);
+                ctx.folds.push((node.id, collapsed));
+                let focused = ctx.focus == Some(node.id);
+                let mut marker_style = Style::default().fg(Color::Cyan);
+                if focused {
+                    marker_style = marker_style.add_modifier(Modifier::REVERSED);
+                }
+                let mut header_parts = vec![
+                    (
+                        format!("{} ", if collapsed { "▶" } else { "▼" }),
+                        marker_style,
+                    ),
+                    (
+                        format!("[{}] ", node.cls),
+                        if focused {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ),
+                ];
+                for seg in &node.header {
+                    match seg {
+                        MsgSeg::Text(span) => header_parts
+                            .push((span.text.clone(), diff_style(&span.diff, Style::default()))),
+                        _ => header_parts.push(("…".to_string(), Style::default())),
+                    }
+                }
+                push_rich(&mut ctx.lines, indent, &header_parts);
+                if !collapsed {
+                    for child in &node.children {
+                        push_segs(ctx, child, indent + 2);
+                    }
+                    if node.truncated {
+                        push_rich(
+                            &mut ctx.lines,
+                            indent + 2,
+                            &[(
+                                "… (not fetched)".to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            )],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    flush(ctx, &mut parts);
 }
 
 /// `file:///a/b/c/d.lean` -> `c/d.lean`.
