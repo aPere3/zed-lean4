@@ -8,10 +8,12 @@ const USAGE: &str = "\
 zed-lean4-companion: companion infoview for the Zed Lean 4 extension
 
 USAGE:
-  zed-lean4-companion proxy [--] <server command...>
+  zed-lean4-companion proxy [--root <dir>] [--] <server command...>
       Run as the language server, proxying stdio to the real server
       (e.g. `zed-lean4-companion proxy -- lake serve --`). Publishes goal
-      state on a unix socket.
+      state on a unix socket. `--root` starts the real server from <dir>
+      (relative to the worktree root), for Lean projects that do not live
+      at the worktree root.
 
   zed-lean4-companion watch
       Run in a terminal inside the worktree: connects to the proxy
@@ -22,6 +24,20 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((mode, rest)) if mode == "proxy" => {
+            let mut rest = rest;
+            let mut root = None;
+            if rest.first().map(String::as_str) == Some("--root") {
+                match rest.get(1) {
+                    Some(dir) => {
+                        root = Some(dir.clone());
+                        rest = &rest[2..];
+                    }
+                    None => {
+                        eprintln!("{USAGE}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             let rest = match rest.first().map(String::as_str) {
                 Some("--") => &rest[1..],
                 _ => rest,
@@ -30,7 +46,7 @@ fn main() {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
             }
-            proxy::run(rest.to_vec())
+            proxy::run(rest.to_vec(), root)
         }
         Some((mode, _)) if mode == "watch" => watch::run(),
         _ => {

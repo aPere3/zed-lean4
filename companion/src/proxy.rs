@@ -69,9 +69,17 @@ struct Shared {
     socket_path: Mutex<Option<std::path::PathBuf>>,
 }
 
-pub fn run(server_cmd: Vec<String>) -> Result<()> {
-    let mut child = Command::new(&server_cmd[0])
-        .args(&server_cmd[1..])
+/// Run the proxy. `root`, when set, is the directory the real server is
+/// started from; Zed always starts us from the worktree root, but `lake
+/// serve` needs its cwd to be the Lean project. A relative `root` resolves
+/// against the current directory.
+pub fn run(server_cmd: Vec<String>, root: Option<String>) -> Result<()> {
+    let mut command = Command::new(&server_cmd[0]);
+    command.args(&server_cmd[1..]);
+    if let Some(root) = root {
+        command.current_dir(root);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
