@@ -85,14 +85,12 @@ pub struct TraceNode {
     pub children: Vec<Vec<MsgSeg>>,
     /// Collapsed by default (server hint).
     pub collapsed: bool,
-    /// Children exist on the server but were not fetched (depth/size cap).
+    /// Children exist on the server but are not fetched yet. The watcher
+    /// requests them by sending `{"expand": id}` back on the socket.
     pub truncated: bool,
     /// Proxy-internal: RpcPtr to fetch the children. Never serialized.
     #[serde(skip)]
     pub lazy_ptr: Option<serde_json::Value>,
-    /// Proxy-internal: nesting depth, for the expansion cap.
-    #[serde(skip)]
-    pub depth: u32,
 }
 
 pub fn socket_dir() -> PathBuf {

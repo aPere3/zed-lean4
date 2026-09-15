@@ -2,7 +2,16 @@ name = "Lean 4"
 grammar = "lean"
 path_suffixes = ["lean"]
 line_comments = ["-- "]
-"blockComment" = ["/-", "-/"]
-autoclose_before = ""
-# brackets = []
+block_comment = ["/- ", " -/"]
+autoclose_before = ";:.,=}])>"
+word_characters = ["'", "!", "?"]
 tab_size = 2
+brackets = [
+  { start = "(", end = ")", close = true, newline = true },
+  { start = "[", end = "]", close = true, newline = true },
+  { start = "{", end = "}", close = true, newline = true },
+  { start = "⟨", end = "⟩", close = true, newline = false },
+  { start = "⦃", end = "⦄", close = true, newline = false },
+  { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+  { start = "/-", end = "-/", close = true, newline = true, not_in = ["string", "comment"] },
+]

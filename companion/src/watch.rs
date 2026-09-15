@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Result};
+use std::io::{BufRead, BufReader, Result, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -23,6 +23,15 @@ pub fn run() -> Result<()> {
     result
 }
 
+#[derive(Clone, Copy)]
+struct Fold {
+    id: u32,
+    /// Effectively collapsed in the last render.
+    collapsed: bool,
+    /// Children not fetched yet: expanding must ask the proxy for them.
+    needs_fetch: bool,
+}
+
 #[derive(Default)]
 struct App {
     state: InfoviewState,
@@ -31,8 +40,8 @@ struct App {
     fold_overrides: HashMap<u32, bool>,
     /// Focused trace node id (target of Enter).
     focus: Option<u32>,
-    /// Trace nodes visible in the last render: (id, effectively collapsed).
-    folds: Vec<(u32, bool)>,
+    /// Trace nodes visible in the last render.
+    folds: Vec<Fold>,
 }
 
 fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
@@ -52,6 +61,9 @@ fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
         let Ok(stream) = UnixStream::connect(&socket) else {
             // Stale socket file: remove it and retry.
             let _ = std::fs::remove_file(&socket);
+            continue;
+        };
+        let Ok(mut writer) = stream.try_clone() else {
             continue;
         };
 
@@ -78,7 +90,16 @@ fn run_inner(terminal: &mut DefaultTerminal) -> Result<()> {
                         KeyCode::Home => app.scroll = 0,
                         KeyCode::Tab => move_focus(&mut app, 1),
                         KeyCode::BackTab => move_focus(&mut app, -1),
-                        KeyCode::Enter | KeyCode::Char(' ') => toggle_focused(&mut app),
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some(node_id) = toggle_focused(&mut app) {
+                                // Ask the proxy to fetch the lazy children.
+                                let _ = writeln!(
+                                    writer,
+                                    "{}",
+                                    serde_json::json!({ "expand": node_id })
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -107,21 +128,22 @@ fn move_focus(app: &mut App, dir: i32) {
     }
     let cur = app
         .focus
-        .and_then(|id| app.folds.iter().position(|(i, _)| *i == id));
+        .and_then(|id| app.folds.iter().position(|f| f.id == id));
     let next = match (cur, dir) {
         (None, _) => 0,
         (Some(i), 1) => (i + 1) % app.folds.len(),
         (Some(i), _) => (i + app.folds.len() - 1) % app.folds.len(),
     };
-    app.focus = Some(app.folds[next].0);
+    app.focus = Some(app.folds[next].id);
 }
 
-fn toggle_focused(app: &mut App) {
-    if let Some(id) = app.focus
-        && let Some((_, collapsed)) = app.folds.iter().find(|(i, _)| *i == id)
-    {
-        app.fold_overrides.insert(id, !collapsed);
-    }
+/// Toggles the focused fold. Returns the node id to fetch from the proxy
+/// when it is being expanded but its children are not loaded yet.
+fn toggle_focused(app: &mut App) -> Option<u32> {
+    let id = app.focus?;
+    let fold = *app.folds.iter().find(|f| f.id == id)?;
+    app.fold_overrides.insert(id, !fold.collapsed);
+    (fold.collapsed && fold.needs_fetch).then_some(id)
 }
 
 fn quit_requested(timeout: Duration) -> Result<bool> {
@@ -218,12 +240,12 @@ fn draw_state(f: &mut Frame, lines: &[Line<'static>], scroll: u16) {
 
 struct Rendered {
     lines: Vec<Line<'static>>,
-    folds: Vec<(u32, bool)>,
+    folds: Vec<Fold>,
 }
 
 struct Ctx<'a> {
     lines: Vec<Line<'static>>,
-    folds: Vec<(u32, bool)>,
+    folds: Vec<Fold>,
     overrides: &'a HashMap<u32, bool>,
     focus: Option<u32>,
 }
@@ -466,7 +488,11 @@ fn push_segs(ctx: &mut Ctx, segs: &[MsgSeg], indent: usize) {
                     .get(&node.id)
                     .copied()
                     .unwrap_or(node.collapsed);
-                ctx.folds.push((node.id, collapsed));
+                ctx.folds.push(Fold {
+                    id: node.id,
+                    collapsed,
+                    needs_fetch: node.truncated,
+                });
                 let focused = ctx.focus == Some(node.id);
                 let mut marker_style = Style::default().fg(Color::Cyan);
                 if focused {
@@ -505,7 +531,7 @@ fn push_segs(ctx: &mut Ctx, segs: &[MsgSeg], indent: usize) {
                             &mut ctx.lines,
                             indent + 2,
                             &[(
-                                "… (not fetched)".to_string(),
+                                "… (loading)".to_string(),
                                 Style::default().fg(Color::DarkGray),
                             )],
                         );

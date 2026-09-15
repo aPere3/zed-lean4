@@ -8,19 +8,18 @@
 //!   `getInteractiveDiagnostics` at the cursor. Its own requests use string
 //!   ids prefixed `infoview:`, so they never collide with Zed's numeric ids,
 //!   and their responses are filtered out of the stream;
-//! - eagerly expands lazy trace children (bounded by depth and count);
+//! - releases the RpcPtr references it received once they are flattened,
+//!   keeping only lazy-trace-children pointers for on-demand expansion;
 //! - broadcasts an `InfoviewState` JSON line to every watcher connected on
-//!   the unix socket, on every change.
-//!
-//! Known simplification: RpcPtr references in responses are never released,
-//! so they accumulate in the server for the lifetime of a session.
+//!   the unix socket, on every change, and accepts `{"expand": <trace id>}`
+//!   commands from watchers to fetch lazy trace children.
 
 use crate::convert;
 use crate::rpc::{read_message, write_message};
 use crate::state::{Diag, InfoviewState, MsgSeg, TextSpan, socket_dir, socket_path_for_root};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::io::{BufReader, Result, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Result, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,10 +28,6 @@ use std::time::Duration;
 
 /// Lean server error code: the RPC session has expired.
 const RPC_NEEDS_RECONNECT: i64 = -32900;
-/// How deep to fetch lazy trace children.
-const MAX_TRACE_DEPTH: u32 = 2;
-/// How many lazy fetches per diagnostics generation.
-const MAX_TRACE_EXPANSIONS: u64 = 64;
 
 #[derive(Clone)]
 struct Cursor {
@@ -44,7 +39,9 @@ struct Cursor {
 struct ExpandReq {
     generation: u64,
     node_id: u32,
-    depth: u32,
+    uri: String,
+    /// The LazyTraceChildren pointer, released once the call has answered.
+    ptr: Value,
 }
 
 struct Shared {
@@ -58,14 +55,16 @@ struct Shared {
     sessions: Mutex<HashMap<String, Value>>,
     /// Pending `$/lean/rpc/connect` request id -> uri.
     pending_connect: Mutex<HashMap<String, String>>,
+    /// Pending goal/term/diag request id -> uri (needed to release refs).
+    pending_goal: Mutex<HashMap<String, String>>,
     /// Pending trace-expansion request id -> request info.
     pending_expand: Mutex<HashMap<String, ExpandReq>>,
     /// Generation of the last goal-request wave; stale responses are dropped.
     generation: AtomicU64,
     /// Generation the displayed interactive diagnostics belong to.
     diag_generation: AtomicU64,
-    /// Lazy expansions done for the current diagnostics generation.
-    expansions: AtomicU64,
+    /// Uri the displayed interactive diagnostics belong to.
+    diag_uri: Mutex<Option<String>>,
     next_req: AtomicU64,
     socket_path: Mutex<Option<std::path::PathBuf>>,
 }
@@ -92,10 +91,11 @@ pub fn run(server_cmd: Vec<String>) -> Result<()> {
         plain_diags: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         pending_connect: Mutex::new(HashMap::new()),
+        pending_goal: Mutex::new(HashMap::new()),
         pending_expand: Mutex::new(HashMap::new()),
         generation: AtomicU64::new(0),
         diag_generation: AtomicU64::new(0),
-        expansions: AtomicU64::new(0),
+        diag_uri: Mutex::new(None),
         next_req: AtomicU64::new(0),
         socket_path: Mutex::new(None),
     });
@@ -347,7 +347,14 @@ fn ensure_session(shared: &Arc<Shared>, uri: &str) {
     );
 }
 
-fn rpc_call(shared: &Shared, c: &Cursor, session_id: &Value, id: String, method: &str, params: Value) {
+fn rpc_call(
+    shared: &Shared,
+    c: &Cursor,
+    session_id: &Value,
+    id: String,
+    method: &str,
+    params: Value,
+) {
     send_to_server(
         shared,
         &json!({
@@ -363,6 +370,35 @@ fn rpc_call(shared: &Shared, c: &Cursor, session_id: &Value, id: String, method:
             },
         }),
     );
+}
+
+/// Frees RpcPtr references we no longer need, so the server can drop them.
+fn release_refs(shared: &Shared, uri: &str, refs: Vec<Value>) {
+    if refs.is_empty() {
+        return;
+    }
+    let Some(session_id) = shared.sessions.lock().unwrap().get(uri).cloned() else {
+        return; // session gone: refs died with it
+    };
+    send_to_server(
+        shared,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "$/lean/rpc/release",
+            "params": { "uri": uri, "sessionId": session_id, "refs": refs },
+        }),
+    );
+}
+
+/// Lazy-children pointers still stored in `segs` (they must stay alive).
+fn kept_ptr_keys(segs: &[MsgSeg]) -> HashSet<String> {
+    let mut kept = HashSet::new();
+    convert::visit_traces(segs, &mut |node| {
+        if let Some(ptr) = &node.lazy_ptr {
+            kept.insert(ptr.to_string());
+        }
+    });
+    kept
 }
 
 fn send_goal_requests(shared: &Arc<Shared>) {
@@ -400,30 +436,19 @@ fn send_goal_requests(shared: &Arc<Shared>) {
         "textDocument": { "uri": c.uri },
         "position": { "line": c.line, "character": c.character },
     });
-    rpc_call(
-        shared,
-        &c,
-        &session_id,
-        format!("infoview:g:{generation}"),
-        "Lean.Widget.getInteractiveGoals",
-        tdpp.clone(),
-    );
-    rpc_call(
-        shared,
-        &c,
-        &session_id,
-        format!("infoview:t:{generation}"),
-        "Lean.Widget.getInteractiveTermGoal",
-        tdpp,
-    );
-    rpc_call(
-        shared,
-        &c,
-        &session_id,
-        format!("infoview:d:{generation}"),
-        "Lean.Widget.getInteractiveDiagnostics",
-        json!({}),
-    );
+    for (kind, method, params) in [
+        ("g", "Lean.Widget.getInteractiveGoals", tdpp.clone()),
+        ("t", "Lean.Widget.getInteractiveTermGoal", tdpp),
+        ("d", "Lean.Widget.getInteractiveDiagnostics", json!({})),
+    ] {
+        let id = format!("infoview:{kind}:{generation}");
+        shared
+            .pending_goal
+            .lock()
+            .unwrap()
+            .insert(id.clone(), c.uri.clone());
+        rpc_call(shared, &c, &session_id, id, method, params);
+    }
     broadcast(shared);
 }
 
@@ -451,7 +476,10 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
         let code = v["error"]["code"].as_i64().unwrap_or(0);
         log(format_args!("<- error for {kind}:{tail}: {}", v["error"]));
         shared.pending_connect.lock().unwrap().remove(id);
-        shared.pending_expand.lock().unwrap().remove(id);
+        shared.pending_goal.lock().unwrap().remove(id);
+        if let Some(req) = shared.pending_expand.lock().unwrap().remove(id) {
+            release_refs(shared, &req.uri, vec![req.ptr]);
+        }
         if code == RPC_NEEDS_RECONNECT
             && let Some(c) = shared.cursor.lock().unwrap().clone()
         {
@@ -468,7 +496,10 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
             };
             let session_id = v["result"]["sessionId"].clone();
             if session_id.is_null() {
-                log(format_args!("<- rpc/connect: no sessionId in {}", v["result"]));
+                log(format_args!(
+                    "<- rpc/connect: no sessionId in {}",
+                    v["result"]
+                ));
                 return true;
             }
             log(format_args!("<- rpc/connect ok for {uri}"));
@@ -488,11 +519,18 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
             }
         }
         "g" | "t" | "d" => {
+            let Some(uri) = shared.pending_goal.lock().unwrap().remove(id) else {
+                return true;
+            };
             let generation = tail.parse::<u64>().unwrap_or(0);
-            if generation != shared.generation.load(Ordering::SeqCst) {
-                return true; // stale
-            }
+            let stale = generation != shared.generation.load(Ordering::SeqCst);
             let result = &v["result"];
+            let mut refs = Vec::new();
+            convert::collect_ptrs(result, &mut refs);
+            if stale {
+                release_refs(shared, &uri, refs);
+                return true;
+            }
             log(format_args!(
                 "<- result for {kind} gen={generation}: {}",
                 if result.is_null() { "null" } else { "ok" }
@@ -506,10 +544,12 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
                             .unwrap_or_default()
                     });
                     shared.state.lock().unwrap().goals = goals;
+                    release_refs(shared, &uri, refs);
                 }
                 "t" => {
                     let term = (!result.is_null()).then(|| convert::conv_term_goal(result));
                     shared.state.lock().unwrap().term_goal = term;
+                    release_refs(shared, &uri, refs);
                 }
                 "d" => {
                     let diags: Vec<Diag> = result
@@ -521,10 +561,30 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    shared.state.lock().unwrap().diagnostics = diags;
+                    // Keep the new lazy-children pointers alive; free the rest.
+                    let kept: HashSet<String> =
+                        diags.iter().flat_map(|d| kept_ptr_keys(&d.message)).collect();
+                    refs.retain(|r| !kept.contains(&r.to_string()));
+                    release_refs(shared, &uri, refs);
+                    // Free the previous diagnostics' unfetched pointers.
+                    let old_uri = shared.diag_uri.lock().unwrap().clone();
+                    let mut old_ptrs = Vec::new();
+                    {
+                        let mut st = shared.state.lock().unwrap();
+                        for d in &mut st.diagnostics {
+                            convert::visit_traces_mut(&mut d.message, &mut |node| {
+                                if let Some(ptr) = node.lazy_ptr.take() {
+                                    old_ptrs.push(ptr);
+                                }
+                            });
+                        }
+                        st.diagnostics = diags;
+                    }
+                    if let Some(old_uri) = old_uri {
+                        release_refs(shared, &old_uri, old_ptrs);
+                    }
+                    *shared.diag_uri.lock().unwrap() = Some(uri);
                     shared.diag_generation.store(generation, Ordering::SeqCst);
-                    shared.expansions.store(0, Ordering::SeqCst);
-                    request_lazy_children(shared);
                 }
                 _ => unreachable!(),
             }
@@ -534,13 +594,21 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
             let Some(req) = shared.pending_expand.lock().unwrap().remove(id) else {
                 return true;
             };
-            if req.generation != shared.diag_generation.load(Ordering::SeqCst) {
-                return true; // diagnostics were replaced meanwhile
+            let result = &v["result"];
+            let mut refs = vec![req.ptr];
+            convert::collect_ptrs(result, &mut refs);
+            let stale = req.generation != shared.diag_generation.load(Ordering::SeqCst);
+            if stale {
+                release_refs(shared, &req.uri, refs);
+                return true;
             }
-            let children = v["result"]
+            let children = result
                 .as_array()
-                .map(|list| convert::conv_children(list, req.node_id as u64, req.depth))
+                .map(|list| convert::conv_children(list, req.node_id as u64))
                 .unwrap_or_default();
+            let kept: HashSet<String> = children.iter().flat_map(|c| kept_ptr_keys(c)).collect();
+            refs.retain(|r| !kept.contains(&r.to_string()));
+            release_refs(shared, &req.uri, refs);
             {
                 let mut st = shared.state.lock().unwrap();
                 for d in &mut st.diagnostics {
@@ -551,7 +619,6 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
                     }
                 }
             }
-            request_lazy_children(shared);
             broadcast(shared);
         }
         _ => {}
@@ -559,52 +626,57 @@ fn handle_our_response(shared: &Arc<Shared>, v: &Value) -> bool {
     true
 }
 
-/// Fires `lazyTraceChildrenToInteractive` calls for unexpanded trace nodes,
-/// bounded by depth and a per-generation budget.
-fn request_lazy_children(shared: &Arc<Shared>) {
-    let Some(c) = shared.cursor.lock().unwrap().clone() else {
+/// Handles an `{"expand": id}` command from a watcher: fetches the lazy
+/// children of that trace node.
+fn expand_trace(shared: &Arc<Shared>, node_id: u32) {
+    let Some(uri) = shared.diag_uri.lock().unwrap().clone() else {
         return;
     };
-    let Some(session_id) = shared.sessions.lock().unwrap().get(&c.uri).cloned() else {
+    let Some(session_id) = shared.sessions.lock().unwrap().get(&uri).cloned() else {
         return;
     };
     let generation = shared.diag_generation.load(Ordering::SeqCst);
-    let mut to_fetch: Vec<(u32, u32, Value)> = Vec::new();
-    {
+    let ptr = {
         let mut st = shared.state.lock().unwrap();
-        for d in &mut st.diagnostics {
-            convert::visit_traces_mut(&mut d.message, &mut |node| {
-                if node.depth < MAX_TRACE_DEPTH
-                    && node.lazy_ptr.is_some()
-                    && shared.expansions.load(Ordering::SeqCst) < MAX_TRACE_EXPANSIONS
-                {
-                    shared.expansions.fetch_add(1, Ordering::SeqCst);
-                    let ptr = node.lazy_ptr.take().expect("checked is_some");
-                    to_fetch.push((node.id, node.depth, ptr));
-                }
-            });
-        }
-    }
-    for (node_id, depth, ptr) in to_fetch {
-        let n = shared.next_req.fetch_add(1, Ordering::SeqCst);
-        let id = format!("infoview:x:{n}");
-        shared.pending_expand.lock().unwrap().insert(
-            id.clone(),
-            ExpandReq {
-                generation,
-                node_id,
-                depth,
-            },
-        );
-        rpc_call(
-            shared,
-            &c,
-            &session_id,
-            id,
-            "Lean.Widget.lazyTraceChildrenToInteractive",
-            ptr,
-        );
-    }
+        st.diagnostics
+            .iter_mut()
+            .find_map(|d| convert::find_trace_mut(&mut d.message, node_id))
+            .and_then(|node| node.lazy_ptr.take())
+    };
+    let Some(ptr) = ptr else {
+        return; // unknown node, or fetch already in flight
+    };
+    // The rpc/call envelope needs a position in the session file; the exact
+    // one does not matter for lazyTraceChildrenToInteractive.
+    let cursor = shared.cursor.lock().unwrap().clone();
+    let c = match cursor {
+        Some(c) if c.uri == uri => c,
+        _ => Cursor {
+            uri: uri.clone(),
+            line: 0,
+            character: 0,
+        },
+    };
+    let n = shared.next_req.fetch_add(1, Ordering::SeqCst);
+    let id = format!("infoview:x:{n}");
+    log(format_args!("-> expand trace node {node_id}"));
+    shared.pending_expand.lock().unwrap().insert(
+        id.clone(),
+        ExpandReq {
+            generation,
+            node_id,
+            uri,
+            ptr: ptr.clone(),
+        },
+    );
+    rpc_call(
+        shared,
+        &c,
+        &session_id,
+        id,
+        "Lean.Widget.lazyTraceChildrenToInteractive",
+        ptr,
+    );
 }
 
 fn start_socket(shared: &Arc<Shared>, root: &str) {
@@ -625,12 +697,29 @@ fn start_socket(shared: &Arc<Shared>, root: &str) {
     let shared = shared.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut stream = stream;
+            let mut write_half = stream;
+            let Ok(read_half) = write_half.try_clone() else {
+                continue;
+            };
             // Greet the new watcher with the current state.
             let line = current_state_line(&shared);
-            if stream.write_all(line.as_bytes()).is_ok() {
-                shared.clients.lock().unwrap().push(stream);
+            if write_half.write_all(line.as_bytes()).is_err() {
+                continue;
             }
+            shared.clients.lock().unwrap().push(write_half);
+            // Commands from this watcher.
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(read_half);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(v) = serde_json::from_str::<Value>(&line)
+                        && let Some(node_id) = v["expand"].as_u64()
+                    {
+                        expand_trace(&shared, node_id as u32);
+                    }
+                }
+            });
         }
     });
 }

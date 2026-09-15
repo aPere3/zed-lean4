@@ -3,7 +3,7 @@
 //!
 //! Skipped (passes trivially) when `lean` is not on PATH.
 
-use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
